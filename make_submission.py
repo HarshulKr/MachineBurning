@@ -35,3 +35,36 @@ for name in ["lgb", "xgb", "cat"]:
         preds.append(m.predict_proba(Xte)[:, 1])
         print(f"  fitted {name} seed {s}", flush=True)
 p = np.mean(preds, axis=0)
+
+# --- test-depot prior shift via EM
+if USE_EM:
+    p_adj, pi_test = F.em_prior_adjust(p, cfg["train_prior"])
+    print(f"EM: train prior={cfg['train_prior']:.4%}, estimated test prior={pi_test:.4%}, "
+          f"mean raw p={p.mean():.4%}")
+    p = p_adj
+
+# --- repair cost given failure (log scale)
+fl = y == 1
+mus = []
+for s in SEEDS:
+    for r in F.make_cost_regressors(seed=s):
+        r.fit(Xtr[fl], np.log1p(tr.repair_cost.values[fl]))
+        mus.append(r.predict(Xte))
+mu = np.mean(mus, axis=0)
+
+flag, budget = F.decide(p, mu, cfg["sigma"] * cfg["sigma_scale"], cfg["margin"])
+sub = pd.DataFrame({"id": te["id"], "flag": flag.astype(int), "budget": np.round(budget, 2)})
+
+# --- format checks against sample_submission
+ss = pd.read_csv(f"{D}/sample_submission.csv")
+assert list(sub.columns) == list(ss.columns), "column mismatch"
+assert len(sub) == len(ss) and (sub["id"].values == ss["id"].values).all(), "id mismatch/order"
+assert sub["flag"].isin([0, 1]).all() and (sub["budget"] >= 0).all() and sub.notna().all().all()
+assert (sub.loc[sub.flag == 0, "budget"] == 0).all()
+sub.to_csv("submission.csv", index=False)
+np.savez("test_preds.npz", p=p, mu=mu)
+print(f"wrote submission.csv: flagged={flag.sum()} ({flag.mean():.2%}), "
+      f"with budget>0={(budget > 0).sum()}, mean budget|budget>0="
+      f"{budget[budget > 0].mean() if (budget > 0).any() else 0:.1f}")
+print(f"expected-cost sanity: sum p*E[c] if nobody flagged = "
+      f"{(p * np.exp(mu + (cfg['sigma'] ** 2) / 2)).sum():,.0f}")
