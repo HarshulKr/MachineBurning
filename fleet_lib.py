@@ -62,3 +62,97 @@ def realised_cost(flag, budget, failure, repair_cost):
     c = np.where(failure == 1, np.nan_to_num(repair_cost), 0.0)
     insp = INSPECT + SHORT * np.maximum(c - budget, 0) + OVER * np.maximum(budget - c, 0)
     return np.where(flag == 1, insp, c)
+
+# ----------------------------------------------------------------------------- decisions
+def decide(p, mu, sigma, flag_margin=1.0):
+    """Bayes-optimal flag & budget for each vehicle.
+
+    p      : calibrated P(failure | x)
+    mu     : predicted mean of log(repair_cost) given failure
+    sigma  : std of log cost given failure (lognormal predictive distribution)
+    flag_margin : flag iff E[cost|skip] > flag_margin * E[cost|inspect]  (1.0 = pure Bayes)
+
+    Budget: the cost distribution is a mixture (0 w.p. 1-p, LogN(mu, sigma) w.p. p).
+    Newsvendor optimum is its CRIT-quantile, which is 0 whenever p < 1 - CRIT (~9.1%).
+    """
+    p = np.clip(p, 1e-9, 1 - 1e-9)
+    sigma = np.broadcast_to(np.asarray(sigma, float), p.shape)
+    q = (CRIT - (1 - p)) / p
+    pos = q > 0
+    b = np.zeros_like(p)
+    b[pos] = np.exp(mu[pos] + sigma[pos] * norm.ppf(np.clip(q[pos], 1e-12, 1 - 1e-9)))
+
+    m = np.exp(mu + sigma ** 2 / 2)  # E[C | fail]
+    lb = np.log(np.maximum(b, 1e-300))
+    z0 = (lb - mu) / sigma
+    z1 = z0 - sigma
+    e_short = np.where(pos, m * norm.sf(z1) - b * norm.sf(z0), m)       # E[(C-b)+ | fail]
+    e_over = np.where(pos, b * norm.cdf(z0) - m * norm.cdf(z1), 0.0)    # E[(b-C)+ | fail]
+    ec_inspect = INSPECT + p * (SHORT * e_short + OVER * e_over) + (1 - p) * OVER * b
+    ec_skip = p * m
+    flag = (ec_skip > flag_margin * ec_inspect).astype(int)
+    return flag, np.where(flag == 1, b, 0.0)
+
+
+# ----------------------------------------------------------------------------- prior shift (EM)
+def em_prior_adjust(p, train_prior, n_iter=200, tol=1e-8):
+    """Saerens-Latinne-Decaestecker EM: re-estimate the class prior on an unlabeled set
+    and rescale posteriors accordingly. Returns (adjusted p, estimated prior)."""
+    p = np.clip(p, 1e-9, 1 - 1e-9)
+    pi = train_prior
+    for _ in range(n_iter):
+        a = p * pi / train_prior
+        bneg = (1 - p) * (1 - pi) / (1 - train_prior)
+        new = a / (a + bneg)
+        pi_new = new.mean()
+        if abs(pi_new - pi) < tol:
+            pi = pi_new
+            break
+        pi = pi_new
+    a = p * pi / train_prior
+    bneg = (1 - p) * (1 - pi) / (1 - train_prior)
+    return a / (a + bneg), pi
+
+
+# ----------------------------------------------------------------------------- models
+LGB_CLF = dict(n_estimators=700, learning_rate=0.02, num_leaves=15, min_child_samples=30,
+               subsample=0.8, subsample_freq=1, colsample_bytree=0.4, reg_lambda=5.0,
+               verbose=-1, n_jobs=2)
+XGB_CLF = dict(n_estimators=700, learning_rate=0.02, max_depth=5, min_child_weight=3,
+               subsample=0.8, colsample_bytree=0.4, reg_lambda=5.0, tree_method="hist",
+               eval_metric="logloss", n_jobs=2, verbosity=0)
+CAT_CLF = dict(iterations=800, learning_rate=0.04, depth=6, l2_leaf_reg=5.0, rsm=0.5,
+               verbose=0, thread_count=2, allow_writing_files=False)
+LGB_REG = dict(n_estimators=300, learning_rate=0.03, num_leaves=7, min_child_samples=10,
+               subsample=0.8, subsample_freq=1, colsample_bytree=0.5, reg_lambda=5.0,
+               verbose=-1, n_jobs=2)
+
+
+def make_classifier(name, seed=0):
+    if name == "lgb":
+        import lightgbm as lgb
+        return lgb.LGBMClassifier(**LGB_CLF, random_state=seed)
+    if name == "xgb":
+        import xgboost as xgb
+        return xgb.XGBClassifier(**XGB_CLF, random_state=seed)
+    if name == "cat":
+        from catboost import CatBoostClassifier
+        return CatBoostClassifier(**CAT_CLF, random_seed=seed)
+    if name == "logreg":
+        from sklearn.pipeline import make_pipeline
+        from sklearn.impute import SimpleImputer
+        from sklearn.preprocessing import FunctionTransformer, StandardScaler
+        from sklearn.linear_model import LogisticRegression
+        return make_pipeline(SimpleImputer(strategy="median", add_indicator=True),
+                             FunctionTransformer(np.log1p), StandardScaler(),
+                             LogisticRegression(C=0.05, max_iter=3000))
+    raise ValueError(name)
+
+
+def make_cost_regressors(seed=0):
+    """Regressors for log1p(repair_cost | failure); predictions are averaged.
+    LightGBM only: in cost_model_experiments.py (5x5 CV) it beat LGB+Ridge on R2 (0.639 vs 0.624),
+    NLL and pinball@0.909; Ridge alone is much weaker (R2 0.538) and dragged the average down.
+    OOF residual sigma for this model is ~0.955 (use as `sigma` in config.json)."""
+    import lightgbm as lgb
+    return [lgb.LGBMRegressor(**LGB_REG, random_state=seed)]
