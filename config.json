@@ -1,0 +1,8 @@
+{
+  "scheme": "drop",
+  "calibration": "raw",
+  "sigma": 0.955,
+  "sigma_scale": 0.8,
+  "margin": 0.8,
+  "train_prior": 0.007089285714285715
+}
