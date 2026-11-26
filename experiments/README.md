@@ -31,3 +31,4 @@ They use only methods from the competition's explicit list:
 | diag_bound / diag_bk / diag_mu | What limits the score: cost breakdown, and the bound from a sharper cost model |
 | cost_fe* / cost_nested* / cost_lin / cost_lasso / cost_mlp / cost_struct | Search for a better repair-cost model: ratios, histogram shares, ridge, lasso, SVR, MLP |
 | full_cmp / full_cmp2 | New vs old cost model inside the full pipeline (paired simulation) |
+| harness / run_h1 / run_h2 / run_h3 / run_stress | Paired tests of the ChatGPT/Gemini suggestions with the classifier held fixed; deterministic prior-weighted scoring at 3/4/5%; re-check on fresh folds; stress grid over prior × cost level |
